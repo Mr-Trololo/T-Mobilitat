@@ -10,7 +10,7 @@ T-Mobilitat cards are used throughout Barcelona for accessing public transit ser
 
 The project investigates two main card types used in the T-Mobilitat system:
 
-- **Infineon CIPURSE-based cards** – Used for most card types. **(script works for this one)**
+- **Infineon CIPURSE-based cards** – Used for most card types. 
 - **MIFARE DESFire cards** – Specifically used for T-Jove (students and people *under 30*'s transit plan).
 
 ## Focus Areas
