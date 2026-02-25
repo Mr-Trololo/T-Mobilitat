@@ -1,154 +1,18 @@
-import httpx
+#!/usr/bin/env python3
+"""T-Mobilitat relay — DESFire EV2 + CIPURSE L"""
+import httpx, json, sys
+
+try:
+    from t_mobilitat_gui import launch_gui
+
+    HAS_GUI = True
+except ImportError:
+    HAS_GUI = False
 from smartcard.System import readers
-from smartcard.util import toHexString
 from protobuf_decoder.protobuf_decoder import Parser
-from typing import Any, List, Optional, Union
 
-from t_mobilitat_gui import launch_gui
-
-
-def int_to_varint(n: int) -> bytes:
-    b = []
-    while True:
-        x = n & 0x7F
-        n >>= 7
-        b.append(x | 0x80 if n else x)
-        if not n:
-            break
-    return bytes(b)
-
-
-def varint_to_hex(n: int) -> str:
-    return int_to_varint(n).hex()
-
-
-def get_field_by_path(
-    proto: dict, path: Union[str, List[int]]
-) -> Optional[Union[Any, List[Any]]]:
-    if isinstance(path, str):
-        parts = [int(p) for p in path.split(".") if p != ""]
-    else:
-        parts = list(path)
-
-    def find(results: List[dict], p: List[int]) -> List[Any]:
-        if not p:
-            return []
-        target, rest = p[0], p[1:]
-        out: List[Any] = []
-        for item in results:
-            if item.get("field") != target:
-                continue
-            data = item.get("data")
-            if not rest:
-                out.append(data)
-            else:
-                if isinstance(data, dict) and isinstance(data.get("results"), list):
-                    out.extend(find(data["results"], rest))
-                elif isinstance(data, list):
-                    out.extend(find(data, rest))
-        return out
-
-    found = find(proto.get("results", []), parts)
-    if not found:
-        return None
-    return found[0] if len(found) == 1 else found
-
-
-class NFCSession:
-    def __init__(self):
-        self.reader = None
-        self.connection = None
-        self.connect()
-
-    def connect(self):
-        rlist = readers()
-        if not rlist:
-            raise RuntimeError("No NFC readers found.")
-        self.reader = rlist[0]
-        self.connection = self.reader.createConnection()
-        self.connection.connect()
-        print(f"[+] Connected to card via {self.reader}")
-
-    def send_apdu(self, apdu: bytes) -> bytes:
-        if not self.connection:
-            raise RuntimeError("Not connected to a card.")
-        apdu_list = list(apdu)
-        response, sw1, sw2 = self.connection.transmit(apdu_list)
-        print(f"[>] APDU sent: {toHexString(apdu_list)}")
-        print(f"[<] Response: {toHexString(response)} SW: {sw1:02X} {sw2:02X}")
-        return bytes(response + [sw1, sw2])
-
-    def get_uid(self) -> str:
-        resp = self.send_apdu(bytes.fromhex("FFCA000000"))
-        uid_bytes = resp[:-2]
-        return "".join(f"{b:02X}" for b in uid_bytes)
-
-    def disconnect(self):
-        if self.connection:
-            self.connection.disconnect()
-            print("[*] Disconnected from card.")
-
-    def get_atr(self) -> str:
-        # many pyscard CardConnection objects provide getATR()
-        atr = bytes(self.connection.getATR())  # may raise if not supported
-        print(f"[<] ATR: {atr.hex().upper()}")
-        return atr.hex().upper()
-
-
-def atr_to_ats(atr_hex: str) -> str:
-    atr = bytes.fromhex(atr_hex)
-
-    t0_byte = atr[1]
-    num_historical_bytes = t0_byte & 0x0F
-
-    # Extract historical bytes (last K bytes before TCK)
-    hist_bytes = atr[-(num_historical_bytes + 1) : -1]
-
-    # PC/SC discards the initial TL/T0 TB/TC from ATS
-    # Reconstruct with known prefix for this card type
-    prefix = bytes.fromhex("1078736000")
-
-    ats = prefix + hist_bytes
-    return ats.hex().upper()
-
-
-def is_desfire_card(atr_hex: str, ats_hex: str) -> bool:
-    """
-    Detect if the card is a MIFARE DESFire card based on ATR and ATS.
-
-    DESFire cards typically have:
-    - ATS T0 byte (position 1) = 0x75 (DESFire D40) or 0x78 (DESFire EV1/EV2/EV3)
-    - Historical bytes containing DESFire identifiers
-    """
-    atr = bytes.fromhex(atr_hex)
-    ats = bytes.fromhex(ats_hex)
-
-    # Check ATS T0 byte (second byte, position 1) for DESFire identifiers
-    if len(ats) >= 2:
-        t0_byte = ats[1]
-        # 0x75 = DESFire D40
-        # 0x78 = DESFire EV1/EV2/EV3
-        if t0_byte == 0x75 or t0_byte == 0x78:
-            return True
-
-    # Check for DESFire identifier bytes anywhere in ATR/ATS
-    if b"\x75" in atr or b"\x75" in ats:
-        return True
-
-    if b"\x78" in atr or b"\x78" in ats:
-        return True
-
-    return False
-
-
-INFINEON_NUMBERS = "08e0db50173b6862"
-DESFIRE_NUMBERS = "85525bac2f6a1b77"
-
-INITIAL_COMMAND = bytes.fromhex(
-    "00000000640a620a1037303537346338396162373166643664120808e0db50173b68621801220231342a086861636B6564363932086d6f746f203432305a28122437636234333735342d323061332d343135652d393261382d32333431333931626535313518016001"
-)
-
-BASE_HEADERS = {
+URL = "https://motorcloud.atm.smarting.es:9032"
+HDRS = {
     "user-agent": "grpc-java-okhttp/1.51.1",
     "content-type": "application/grpc",
     "te": "trailers",
@@ -156,249 +20,318 @@ BASE_HEADERS = {
     "grpc-accept-encoding": "gzip",
 }
 
-API_BASE_URL = "https://motorcloud.atm.smarting.es:9032"
-API_TIMEOUT = 10.0
+DESFIRE_NUMBERS = "85525bac2f6a1b77"
+INFINEON_NUMBERS = "08e0db50173b6862"
 
 
-# --- Helper Functions ---
-def send_post_request(
-    client: httpx.Client, endpoint: str, headers: dict, content: bytes
-) -> httpx.Response:
-    url = f"{API_BASE_URL}/{endpoint}"
-    response = client.post(url, headers=headers, content=content, timeout=API_TIMEOUT)
-    response.raise_for_status()
-    return response
+# --- Protobuf / gRPC ---
+def varint(n):
+    out = []
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            break
+    return bytes(out)
+
+
+def pb(field, data):
+    if isinstance(data, int):
+        return varint(field << 3) + varint(data)
+    if isinstance(data, str):
+        data = data.encode()
+    return varint(field << 3 | 2) + varint(len(data)) + data
+
+
+def grpc(p):
+    return b"\x00" + len(p).to_bytes(4, "big") + p
+
+
+def pb_get(d, path):
+    parts = [int(p) for p in path.split(".")]
+
+    def walk(results, ps):
+        if not ps:
+            return []
+        t, rest = ps[0], ps[1:]
+        out = []
+        for item in results:
+            if item.get("field") != t:
+                continue
+            data = item.get("data")
+            if not rest:
+                out.append(data)
+            elif isinstance(data, dict):
+                out.extend(walk(data.get("results", []), rest))
+        return out
+
+    r = walk(d.get("results", []), parts)
+    return r[0] if len(r) == 1 else r or None
+
+
+def try_parse(resp, label=""):
+    for skip in [1, 5, 2, 3, 4, 0]:
+        try:
+            p = Parser().parse(resp.hex()[skip * 2 :]).to_dict()
+            num = pb_get(p, "3.2")
+            if num is not None:
+                return p, num
+        except:
+            continue
+    print(f"  [!] parse failed for {label}")
+    return None, None
+
+
+# --- NFC ---
+def apdu(conn, cmd):
+    if isinstance(cmd, str):
+        cmd = bytes.fromhex(cmd.replace(" ", ""))
+    r, s1, s2 = conn.transmit(list(cmd))
+    out = bytes(r + [s1, s2])
+    print(f"  [>] {cmd.hex()}")
+    print(f"  [<] {out.hex()}")
+    return out
+
+
+# --- API ---
+def api(client, endpoint, payload):
+    r = client.post(
+        f"{URL}/{endpoint}", headers=HDRS, content=grpc(payload), timeout=10
+    )
+    r.raise_for_status()
+    return r.content
+
+
+def device_block(numbers, session_id=None):
+    b = (
+        pb(1, "70574c89ab71fd6d")
+        + pb(2, bytes.fromhex(numbers))
+        + pb(3, 1)
+        + pb(4, "14")
+        + pb(5, "hacked69")
+        + pb(6, "moto 420")
+    )
+    if session_id:
+        b += pb(11, pb(2, session_id) + pb(3, 1))
+    b += pb(12, 1)
+    return b
+
+
+def sc_response(uuid, num, card_resp):
+    return pb(1, uuid) + pb(2, pb(2, num) + pb(3, pb(1, card_resp)))
+
+
+def detect_card_type(conn):
+    """Probe card: SELECT DESFire AID, then confirm with GetVersion."""
+    # Step 1: try DESFire app SELECT
+    r, s1, s2 = conn.transmit(list(bytes.fromhex("00A4040007F053555341544D")))
+    if s1 == 0x90 and s2 == 0x00:
+        # Step 2: confirm — only real DESFire responds 91AF to GetVersion
+        r2, s3, s4 = conn.transmit(list(bytes.fromhex("9060000000")))
+        if s3 == 0x91 and s4 == 0xAF:
+            print("[+] Probe: SELECT 9000 + GetVersion 91AF → DESFire")
+            return "desfire"
+        print(f"[+] Probe: SELECT 9000 but GetVersion {s3:02X}{s4:02X} → CIPURSE")
+    else:
+        print(f"[+] Probe: SELECT {s1:02X}{s2:02X} → CIPURSE")
+    # Reset for CIPURSE
+    conn.transmit(list(bytes.fromhex("00A40000020005")))
+    return "cipurse"
+
+
+def extract_cipurse_reads(rhex):
+    """Extract all CIPURSE READ BINARY (04 B0) commands from server response."""
+    cmds = []
+    idx = 0
+    while True:
+        pos = rhex.find("04b0", idx)
+        if pos == -1:
+            break
+        cmd_hex = rhex[pos : pos + 16]  # 8 bytes = 16 hex chars
+        if len(cmd_hex) == 16:
+            cmds.append(bytes.fromhex(cmd_hex))
+        idx = pos + 16
+    return cmds
+
+
+def atr_to_ats(atr_hex):
+    atr = bytes.fromhex(atr_hex)
+    hist_len = atr[1] & 0x0F
+    hist = atr[-(hist_len + 1) : -1]
+    return bytes.fromhex("1078736000") + hist
+
+
+def extract_json(r):
+    raw = r.hex()
+    idx = raw.find("7b22737573")
+    if idx == -1:
+        return None
+    jb = bytes.fromhex(raw[idx:])
+    return json.loads(jb[: jb.rfind(b"}") + 1])
 
 
 def main():
-    with httpx.Client(http2=True, verify=False) as client:
-        # Step 1: Open session with the server
+    conn = readers()[0].createConnection()
+    conn.connect()
+
+    uid = apdu(conn, "FF CA 00 00 00")[:-2]
+    atr = bytes(conn.getATR()).hex()
+    card_type = detect_card_type(conn)
+    ats = atr_to_ats(atr)
+
+    print(f"\n[+] UID: {uid.hex()}")
+    print(f"[+] ATR: {atr}")
+    print(f"[+] Card type: {card_type.upper()}")
+    if card_type == "desfire":
+        print(f"[+] ATS: {ats.hex()}")
+    print()
+
+    with httpx.Client(http2=True, verify=False) as c:
+        # 1. Open session
         print("[*] Opening session...")
-        headers = BASE_HEADERS.copy()
-        headers["session-id"] = "hello t-mobilitat"
-
-        response = send_post_request(
-            client, "DeviceContextService/openSession", headers, INITIAL_COMMAND
+        HDRS["session-id"] = "hello t-mobilitat"
+        r = api(
+            c,
+            "DeviceContextService/openSession",
+            pb(
+                1,
+                device_block(INFINEON_NUMBERS, "7cb43754-20a3-415e-92a8-2341391be515"),
+            ),
         )
-        session_id = response.content.hex()[18:90]
-        print(f"Session ID (hex): {session_id}")
+        sid = bytes.fromhex(r.hex()[18:90]).decode()
+        HDRS["session-id"] = sid
+        print(f"[+] Session: {sid}\n")
 
-        # Step 2: Connect to NFC card and get card info
-        print("[*] Connecting to NFC card...")
-        nfc_session = NFCSession()
-        card_uid = nfc_session.get_uid()
-        atr = nfc_session.get_atr()
-        ats = atr_to_ats(atr)
-        is_desfire = is_desfire_card(atr, ats)
-
-        print(f"RATS: {ats}")
-        print(f"Card UID: {card_uid}")
-        if is_desfire:
-            print("[*] Card type: MIFARE DESFire detected!")
-
-        # Step 3: Execute direct operation
-        print("[*] Executing direct operation...")
-        card_numbers = DESFIRE_NUMBERS if is_desfire else INFINEON_NUMBERS
-        command1_hex = (
-            "000000008b0a620a10373035373463383961623731666436641208"
-            + card_numbers
-            + "1801220231342a086861636B6564363932086d6f746f203432305a281224"
-            + session_id
-            + "1801600110011a1b0a07"
-            + card_uid
-            + "1210"
-            + ats
-            + "2206080212020805"
-        )
-
-        headers["session-id"] = bytes.fromhex(session_id).decode("utf-8")
-        response = send_post_request(
-            client,
+        # 2. Register card
+        print("[*] Registering card...")
+        card_numbers = DESFIRE_NUMBERS if card_type == "desfire" else INFINEON_NUMBERS
+        card_info = pb(1, uid) + pb(2, ats) + pb(4, pb(1, 2) + pb(2, pb(1, 5)))
+        r = api(
+            c,
             "SmartcardService/executeDirectOperation",
-            headers,
-            bytes.fromhex(command1_hex),
+            pb(1, device_block(card_numbers, sid)) + pb(2, 1) + pb(3, card_info),
         )
+        p, num = try_parse(r, "register")
+        uuid1 = pb_get(p, "1")
+        print(f"[+] UUID: {uuid1}, Seq: {num}\n")
 
-        # Parse response to extract UUID and num
-        parsed_response = Parser().parse(response.content.hex()[2:])
-        response_dict = parsed_response.to_dict()
-        uuid1 = get_field_by_path(response_dict, "1")
-        num = bytes.fromhex(varint_to_hex(get_field_by_path(response_dict, "3.2")))
-        print(f"UUID1: {uuid1}, Num: {num.hex()}")
-
-        # Step 4: First smartcard response
-        print("[*] Sending first smartcard response...")
-        cardresponse = (
-            bytes.fromhex(f"00000000{(len(num)+47):02X}0a24")
-            + uuid1.encode("latin1")
-            + bytes.fromhex(f"12{(len(num)+7):02X}10")
-            + num
-            + bytes.fromhex("1a040a02")
-            + bytes.fromhex("9000")
-        )
-
-        response = send_post_request(
-            client, "SmartcardService/smartCardResponse", headers, cardresponse
-        )
-        parsed_response = Parser().parse(response.content.hex()[2:])
-        num = bytes.fromhex(
-            varint_to_hex(get_field_by_path(parsed_response.to_dict(), "3.2"))
-        )
-        print(f"Num (after server): {num.hex()}")
-
-        # Step 5: Send APDU commands (select + authenticate A)
-        print("[*] Authenticating with card (phase A)...")
-        if is_desfire:
-            nfc_session.send_apdu(b"\x00\xa4\x04\x00\x07\xf0\x53\x55\x53\x41\x54\x4d")
-            resp_apdu = nfc_session.send_apdu(
-                b"\x90\x71\x00\x00\x08\x03\x06\x00\x00\x00\x00\x00\x00\x00"
-            )
+        # 3. Select app
+        print("[*] Selecting application...")
+        if card_type == "desfire":
+            apdu(conn, "00 A4 04 00 07 F0 53 55 53 41 54 4D")
         else:
-            nfc_session.send_apdu(b"\x00\xa4\x00\x00\x02\x00\x05")
-            resp_apdu = nfc_session.send_apdu(b"\x00\x84\x00\x00\x16")
+            apdu(conn, "00 A4 00 00 02 00 05")
 
-        # Step 6: Second smartcard response with APDU result
-        print("[*] Sending second smartcard response...")
-        if is_desfire:
-            cardresponse2 = (
-                bytes.fromhex(f"00000000{(2+36+3+len(num)+4+18):02X}0a24")
-                + uuid1.encode("latin1")
-                + bytes.fromhex(f"12{(len(num)+23):02X}10")
-                + num
-                + bytes.fromhex("1a140a12")
-                + resp_apdu
-            )
-        else:
-            cardresponse2 = (
-                bytes.fromhex(f"00000000{(2+36+3+len(num)+4+24):02X}0a24")
-                + uuid1.encode("latin1")
-                + bytes.fromhex(f"12{(len(num)+29):02X}10")
-                + num
-                + bytes.fromhex("1a1a0a18")
-                + resp_apdu
-            )
-
-        response = send_post_request(
-            client, "SmartcardService/smartCardResponse", headers, cardresponse2
+        r = api(
+            c,
+            "SmartcardService/smartCardResponse",
+            sc_response(uuid1, num, b"\x90\x00"),
         )
-        print(f"[DEBUG] Response: {response.content.hex()[10:]}")
+        p, num = try_parse(r, "select")
 
-        # Step 7: Parse response and execute authenticate B
-        print("[*] Authenticating with card (phase B)...")
-        parsed_response = Parser().parse(response.content.hex()[10:])
-        num = bytes.fromhex(
-            varint_to_hex(get_field_by_path(parsed_response.to_dict(), "3.2"))
-        )
-
-        # Extract embedded command from server response
-        response_hex = response.content.hex()
-        if is_desfire:
-            start = response_hex.find("90af")
-            command_hex = response_hex[start : start + 76]
+        # 4. Auth phase A
+        print("\n[*] Auth phase A...")
+        if card_type == "desfire":
+            auth_a = apdu(conn, "90 71 00 00 08 03 06 00 00 00 00 00 00 00")
         else:
-            start = response_hex.find("00820001")
-            if start == -1 or len(response_hex) < start + 88:
-                raise RuntimeError("No valid command sequence found in response")
-            command_hex = response_hex[start : start + 88]
+            auth_a = apdu(conn, "00 84 00 00 16")
 
-        command_apdu = bytes.fromhex(command_hex)
-        print(f"[DEBUG] Command to card: {command_apdu.hex()}")
-        auth_b_response = nfc_session.send_apdu(command_apdu)
-
-        # Step 8: Third smartcard response with authentication B result
-        print("[*] Sending third smartcard response...")
-        if is_desfire:
-            cardresponse3 = (
-                bytes.fromhex(f"00000000{(2+36+3+len(num)+4+34):02X}0a24")
-                + uuid1.encode("latin1")
-                + bytes.fromhex(f"12{(1+len(num)+4+34):02X}10")
-                + num
-                + bytes.fromhex("1a240a22")
-                + auth_b_response
-            )
-        else:
-            cardresponse3 = (
-                bytes.fromhex(f"00000000{(2+36+3+len(num)+4+18):02X}0a24")
-                + uuid1.encode("latin1")
-                + bytes.fromhex(f"12{(len(num)+23):02X}10")
-                + num
-                + bytes.fromhex("1a140a12")
-                + auth_b_response
-            )
-
-        response = send_post_request(
-            client, "SmartcardService/smartCardResponse", headers, cardresponse3
+        r = api(
+            c, "SmartcardService/smartCardResponse", sc_response(uuid1, num, auth_a)
         )
+        p, num = try_parse(r, "auth_a")
 
-        # Step 9: Read files from card
-        print("[*] Reading card data files...")
-        if is_desfire:
-            file_data_1 = nfc_session.send_apdu(
-                bytes.fromhex("90ad00000707000000f8000000")
-            )
-            file_data_2 = nfc_session.send_apdu(
-                bytes.fromhex("90ad00000707f8000008000000")
-            )
+        # 5. Extract server auth command
+        rhex = r.hex()
+        if card_type == "desfire":
+            idx = rhex.find("90af")
+            if idx == -1:
+                raise RuntimeError("No 90AF in server response")
+            cmd = bytes.fromhex(rhex[idx : idx + 76])
         else:
-            file_data_1 = nfc_session.send_apdu(bytes.fromhex("04b0930002019000"))
-            file_data_2 = nfc_session.send_apdu(bytes.fromhex("04b0940002019000"))
+            idx = rhex.find("008200")
+            if idx == -1:
+                raise RuntimeError("No MUTUAL AUTH (0082) in server response")
+            cmd = bytes.fromhex(rhex[idx : idx + 88])
 
-        # Parse final num from previous response
-        parsed_response = Parser().parse(response.content.hex()[10:])
-        final_num = bytes.fromhex(
-            varint_to_hex(get_field_by_path(parsed_response.to_dict(), "3.2"))
+        # 6. Auth phase B
+        print("\n[*] Auth phase B...")
+        auth_b = apdu(conn, cmd)
+        r = api(
+            c, "SmartcardService/smartCardResponse", sc_response(uuid1, num, auth_b)
         )
-        print(f"[DEBUG] Final num: {final_num.hex()}")
+        p, num = try_parse(r, "auth_b")
 
-        # Step 10: Final smartcard response with file data
-        print("[*] Sending final smartcard response...")
-        if is_desfire:
-            body = (
-                bytes.fromhex("0A24")
-                + uuid1.encode("latin1")
-                + bytes.fromhex("12")
-                + int_to_varint(len(final_num) + 271)
-                + bytes.fromhex("10")
-                + final_num
-                + bytes.fromhex("1Afd010Afa01")
-                + file_data_1
-                + bytes.fromhex("1A0c0a0a")
-                + file_data_2
-            )
+        if num is None:
+            print("[!] Failed to get sequence after auth")
+            print(f"[DEBUG] {r.hex()}")
+            sys.exit(1)
+
+        print(f"\n[+] ✓ Auth complete (seq={num})")
+
+        # 7. Read files
+        if card_type == "desfire":
+            print("\n[*] Reading file 7 (256 bytes)...")
+            f_a = apdu(conn, "90 AD 00 00 07 07 00 00 00 F8 00 00 00")
+            f_b = apdu(conn, "90 AD 00 00 07 07 F8 00 00 08 00 00 00")
+            file_data = f_a[:-2] + f_b[:-2]
+            file_responses = [f_a, f_b]
+            cipurse_files = []
         else:
-            body = (
-                bytes.fromhex("0A24")
-                + uuid1.encode("latin1")
-                + bytes.fromhex("12")
-                + int_to_varint(len(final_num) + 305)
-                + bytes.fromhex("10")
-                + final_num
-                + bytes.fromhex("1A95010A9201")
-                + file_data_1
-                + bytes.fromhex("1A95010A9201")
-                + file_data_2
-            )
+            # Extract READ BINARY commands dynamically from server response
+            read_cmds = extract_cipurse_reads(r.hex())
+            if not read_cmds:
+                raise RuntimeError("No CIPURSE READ BINARY commands in response")
 
-        cardresponse4 = b"\x00" + len(body).to_bytes(4, "big") + body
-        response = send_post_request(
-            client, "SmartcardService/smartCardResponse", headers, cardresponse4
-        )
+            print(f"\n[*] Reading {len(read_cmds)} CIPURSE files...")
+            file_responses = []
+            cipurse_files = []
+            for cmd in read_cmds:
+                file_id = cmd[2]  # P1 = file ID
+                resp = apdu(conn, cmd)
+                file_responses.append(resp)
+                cipurse_files.append((file_id, resp[:-2]))  # (id, data without SW)
 
-        # Step 11: Parse and display card data
-        print("[*] Parsing card data...")
-        print(f"[DEBUG] Raw card data: {response.content.hex()}")
+        # 8. Send to server
+        print("\n[*] Sending to server...")
+        inner = pb(2, num)
+        for resp in file_responses:
+            inner += pb(3, pb(1, resp))
+        payload = pb(1, uuid1) + pb(2, inner)
+        r = api(c, "SmartcardService/smartCardResponse", payload)
 
-        parsed_data = Parser().parse(response.content.hex()[10:])
-        data_dict = parsed_data.to_dict()
-        card_data = data_dict["results"][1]["data"]["results"][2]["data"]["results"][1][
-            "data"
-        ]["results"][0]["data"]
+        # 9. Parse JSON
+        print("\n[*] Parsing response...")
+        card_data = extract_json(r)
+        if card_data:
+            print(json.dumps(card_data, indent=2, ensure_ascii=False))
+        else:
+            print(f"[!] No JSON in response")
+            print(f"[DEBUG] {r.hex()[:200]}")
 
-        print(card_data)
-        nfc_session.disconnect()
+        # 10. Print hex strings for decoder
+        print(f"\n{'='*70}")
+        print("  FILE DATA (copy to decoder)")
+        print(f"{'='*70}")
 
-        # Launch GUI with card data
-        launch_gui(card_data)
+        if card_type == "desfire":
+            print(f"\n  File 7 ({len(file_data)} bytes):")
+            print(f"  {file_data.hex()}\n")
+        else:
+            for file_id, fdata in cipurse_files:
+                print(f"\n  File 0x{file_id:02X} ({len(fdata)} bytes):")
+                print(f"  {fdata.hex()}")
+            print()
+
+        conn.disconnect()
+
+    # 11. Launch GUI if available
+    if card_data and HAS_GUI:
+        print("[*] Launching GUI...")
+        launch_gui(json.dumps(card_data, ensure_ascii=False))
+    elif card_data and not HAS_GUI:
+        print("[*] GUI not available (place t_mobilitat_gui.py alongside this script)")
 
 
 if __name__ == "__main__":
