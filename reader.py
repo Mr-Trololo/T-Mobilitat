@@ -8,7 +8,8 @@ try:
     HAS_GUI = True
 except ImportError:
     HAS_GUI = False
-from smartcard.System import readers
+# from smartcard.System import readers
+from PN532 import readers
 from protobuf_decoder.protobuf_decoder import Parser
 
 URL = "https://motorcloud.atm.smarting.es:9032"
